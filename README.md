@@ -1,6 +1,14 @@
 # gm_8bit
 A module for manipulating voice data in Garry's Mod.
 
+> **About this fork.** Upstream is [Meachamp/gm_8bit](https://github.com/Meachamp/gm_8bit).
+> [xyecoc-moJlokococ/gm_8bit](https://github.com/xyecoc-moJlokococ/gm_8bit) replaced the
+> built-in C++ audio effects with a scriptable `ApplyVoiceEffect` Lua hook. This fork keeps
+> that idea but fixes the memory-safety and denial-of-service problems in its implementation
+> (Lua stack underflow on the hook's error path, a per-packet table allocation, a
+> use-after-free on the codec, an unbounded `memcpy`, and undefined behaviour in the sample
+> conversion). See the commit history for details. Licensed LGPL-2.1, same as upstream.
+
 # What does it do?
 gm_8bit is designed to be a starting point for any kind of voice stream manipulation you might want to do on a Garry's Mod server (or any source engine server, with a bit of adjustment).
 

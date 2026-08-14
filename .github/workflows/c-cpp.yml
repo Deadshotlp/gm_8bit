@@ -3,62 +3,41 @@ name: Build
 on:
   push:
     branches: [ master ]
+  pull_request:
   workflow_dispatch:
 
 jobs:
   build-linux:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
+    - uses: actions/checkout@v4
       with:
         submodules: recursive
         repository: danielga/garrysmod_common
-        ref: master
+        # Pinned instead of tracking master, so a change upstream can't silently
+        # break or alter the binaries this repo produces.
+        ref: f77a18d86f780a59ea30e4237016b05b790d4b70
         path: 'garrysmod_common'
-    - name: Install Premake
+    - name: Install dependencies
       run: |
         wget https://github.com/premake/premake-core/releases/download/v5.0.0-beta2/premake-5.0.0-beta2-linux.tar.gz -O premake.tar.gz
-        tar -xvf premake.tar.gz
+        tar -xf premake.tar.gz
         chmod +x premake5
         sudo cp premake5 /usr/bin
         sudo apt-get update
-        sudo apt-get install g++-multilib
+        sudo apt-get install -y g++-multilib
         gcc --version
+    - name: Test
+      run: GMCOMMON=garrysmod_common ./test/run.sh
     - name: Generate Project
-      run: |
-        premake5 --gmcommon=garrysmod_common gmake
-    - name: Make
+      run: premake5 --gmcommon=garrysmod_common gmake
+    - name: Build
       run: |
         cd projects/linux/gmake
-        make
         make config=release_x86
     - uses: actions/upload-artifact@v4
       with:
         name: gmsv_eightbit_linux.dll
         path: projects/linux/gmake/x86/Release/gmsv_eightbit_linux.dll
-  build-windows:
-    runs-on: windows-2019
-    steps:
-    - uses: actions/checkout@v2
-    - uses: actions/checkout@v2
-      with:
-        submodules: recursive
-        repository: danielga/garrysmod_common
-        path: 'garrysmod_common'
-        ref: master
-    - name: Install Premake
-      run: |
-         curl -L https://github.com/premake/premake-core/releases/download/v5.0.0-beta2/premake-5.0.0-beta2-windows.zip -o premake.zip
-         tar -xf premake.zip
-    - name: Generate Project
-      run: |
-        ./premake5.exe --gmcommon=garrysmod_common vs2019
-    - name: Build
-      run: |
-        cd projects/windows/vs2019
-        & "C:\Program Files (x86)\Microsoft Visual Studio\2019\Enterprise\MSBuild\Current\Bin\msbuild.exe" /p:Configuration=Release /p:Platform=Win32 eightbit.sln
-    - uses: actions/upload-artifact@v4
-      with:
-        name: gmsv_eightbit_windows.dll
-        path: projects/windows/vs2019/x86/Release/gmsv_eightbit_win32.dll
+        if-no-files-found: error
