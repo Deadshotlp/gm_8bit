@@ -61,4 +61,4 @@ jobs:
     - uses: actions/upload-artifact@v4
       with:
         name: gmsv_eightbit_windows.dll
-        path: projects/windows/vs2019/x86/ReleaseWithSymbols/gmsv_eightbit_win32.dll
+        path: projects/windows/vs2019/x86/Release/gmsv_eightbit_win32.dll

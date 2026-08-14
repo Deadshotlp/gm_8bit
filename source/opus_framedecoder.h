@@ -36,10 +36,20 @@ namespace SteamOpus {
 
     public:
         Opus_FrameDecoder() {
-            int error = 0;
+            int decError = OPUS_OK;
+            int encError = OPUS_OK;
 
-            dec = opus_decoder_create(SAMPLERATE_GMOD_OPUS, 1, &error);
-            enc = opus_encoder_create(SAMPLERATE_GMOD_OPUS, 1, OPUS_APPLICATION_VOIP, &error);
+            dec = opus_decoder_create(SAMPLERATE_GMOD_OPUS, 1, &decError);
+            enc = opus_encoder_create(SAMPLERATE_GMOD_OPUS, 1, OPUS_APPLICATION_VOIP, &encError);
+
+            if (decError != OPUS_OK) dec = nullptr;
+            if (encError != OPUS_OK) enc = nullptr;
+        }
+
+        //opus_*_create can fail (allocation failure); the caller must not use a codec that
+        //came back half-initialised, or Compress/Decompress dereference a null handle.
+        bool IsValid() const {
+            return dec != nullptr && enc != nullptr;
         }
 
         virtual bool Init(int quality, int sampleRate) {

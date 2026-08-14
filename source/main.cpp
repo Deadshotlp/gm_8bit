@@ -6,6 +6,7 @@
 #include <detouring/hook.hpp>
 #include <iostream>
 #include <iclient.h>
+#include <tier0/dbg.h>
 #include <unordered_map>
 #include "ivoicecodec.h"
 #include "net.h"
@@ -16,6 +17,7 @@
 #include <cstdint>
 #include <cstring>
 #include "opus_framedecoder.h"
+#include "voice_effect_hook.h"
 
 #define STEAM_PCKT_SZ sizeof(uint64_t) + sizeof(CRC32_t)
 #ifdef SYSTEM_WINDOWS
@@ -49,8 +51,14 @@ EightbitState* g_eightbit = nullptr;
 typedef void (*SV_BroadcastVoiceData)(IClient* cl, int nBytes, char* data, int64 xuid);
 Detouring::Hook detour_BroadcastVoiceData;
 
-// V rot ebat tebya
-lua_State* luaState = NULL;
+lua_State* luaState = nullptr;
+
+//Reusable table handed to the ApplyVoiceEffect hook. Allocating a fresh table for every
+//voice packet (20-40 per second per player) is what made this module a DoS vector.
+static int g_sampleTableRef = -1;
+//How many indices we populated last time, so we can clear the tail instead of leaking
+//another player's samples into a script that ignores the count argument.
+static int g_sampleTableFill = 0;
 
 void hook_BroadcastVoiceData(IClient* cl, uint nBytes, char* data, int64 xuid) {
 	//Check if the player is in the set of enabled players.
@@ -65,7 +73,7 @@ void hook_BroadcastVoiceData(IClient* cl, uint nBytes, char* data, int64 xuid) {
 #endif
 
 	auto& afflicted_players = g_eightbit->afflictedPlayers;
-	if (g_eightbit->broadcastPackets && nBytes > sizeof(uint64_t)) {
+	if (g_eightbit->broadcastPackets && nBytes > sizeof(uint64_t) && nBytes <= sizeof(decompressedBuffer)) {
 		//Get the user's steamid64, put it at the beginning of the buffer.
 		//Notice that we don't use the conveniently provided one in the voice packet. The client can manipulate that one.
 
@@ -94,52 +102,30 @@ void hook_BroadcastVoiceData(IClient* cl, uint nBytes, char* data, int64 xuid) {
 		}
 
 		int bytesDecompressed = SteamVoice::DecompressIntoBuffer(codec, data, nBytes, decompressedBuffer, sizeof(decompressedBuffer));
-		int samples = bytesDecompressed / 2;
 		if (bytesDecompressed <= 0) {
 			//Just hit the trampoline at this point.
 			return detour_BroadcastVoiceData.GetTrampoline<SV_BroadcastVoiceData>()(cl, nBytes, data, xuid);
 		}
 
+		int samples = bytesDecompressed / 2;
+
 		#ifdef _DEBUG
 			std::cout << "Decompressed samples " << samples << std::endl;
 		#endif
 
-		GarrysMod::Lua::ILuaBase* LAU = luaState->luabase;
-		LAU->PushSpecial(GarrysMod::Lua::SPECIAL_GLOB);  // +1
-			LAU->GetField(-1, "hook");                      // +1
-				LAU->GetField(-1, "Run");                       // +1
-				LAU->PushString("ApplyVoiceEffect");            // +1
+		std::string hookError;
+		if (!VoiceEffect::Run(luaState ? luaState->luabase : nullptr, g_sampleTableRef, g_sampleTableFill,
+		                      uid, reinterpret_cast<int16_t*>(decompressedBuffer), samples, hookError)) {
+			Warning("[eightbit] ApplyVoiceEffect error: %s\n", hookError.c_str());
+		}
 
-        			LAU->PushNumber(uid);
-				LAU->CreateTable();
-				for (int i = 0; i < samples; ++i) {
-				    LAU->PushNumber(i + 1);
-				    LAU->PushNumber(static_cast<double>(static_cast<int16_t>(reinterpret_cast<uint16_t*>(decompressedBuffer)[i]) - 32768));
-				    LAU->SetTable(-3);
-				}
-				LAU->PushNumber(samples);
-
-				if (LAU->PCall(4, 1, 0) != 0) {
-					Warning("[eightbit_module error] %s\n", LAU->GetString());
-					LAU->Pop();
-				}
-		
-				if (LAU->GetType(-1) == GarrysMod::Lua::Type::Table) {
-				    for (int i = 0; i < samples; ++i) {
-				        LAU->PushNumber(i + 1);
-				        LAU->GetTable(-2);
-
-				        double luaValue = LAU->GetNumber(-1);
-				        int16_t signedSample = static_cast<int16_t>(luaValue);
-				        reinterpret_cast<uint16_t*>(decompressedBuffer)[i] = static_cast<uint16_t>(signedSample + 32768);
-
-				        LAU->Pop();
-				    }
-				}
-				
-				LAU->Pop();
-			LAU->Pop();
-		LAU->Pop();
+		//The hook ran arbitrary Lua, which may have called EnableEffects and deleted our
+		//codec out from under us. Look it up again instead of reusing the stale pointer.
+		auto it = afflicted_players.find(uid);
+		if (it == afflicted_players.end()) {
+			return detour_BroadcastVoiceData.GetTrampoline<SV_BroadcastVoiceData>()(cl, nBytes, data, xuid);
+		}
+		codec = std::get<0>(it->second);
 
 		//Recompress the stream
 		uint64_t steamid = *(uint64_t*)data;
@@ -161,28 +147,41 @@ void hook_BroadcastVoiceData(IClient* cl, uint nBytes, char* data, int64 xuid) {
 }
 
 LUA_FUNCTION_STATIC(eightbit_setbroadcastip) {
-	g_eightbit->ip = std::string(LUA->GetString());
+	//CheckString errors on a bad argument instead of handing us a null pointer.
+	g_eightbit->ip = std::string(LUA->CheckString(1));
 	return 0;
 }
 
 LUA_FUNCTION_STATIC(eightbit_setbroadcastport) {
-	g_eightbit->port = (uint16_t)LUA->GetNumber(1);
+	double port = LUA->CheckNumber(1);
+	if (port < 1.0 || port > 65535.0)
+		LUA->ArgError(1, "port must be between 1 and 65535");
+
+	g_eightbit->port = (uint16_t)port;
 	return 0;
 }
 
 LUA_FUNCTION_STATIC(eightbit_broadcast) {
+	LUA->CheckType(1, GarrysMod::Lua::Type::Bool);
 	g_eightbit->broadcastPackets = LUA->GetBool(1);
 	return 0;
 }
 
 LUA_FUNCTION_STATIC(eightbit_setsamplerate) {
-	g_eightbit->sample_rate = LUA->GetNumber(1);
+	//This value is only written into the packet header - the encoder itself always runs at
+	//24000 Hz, so the client resampling it is what produces the pitch shift. Keep it inside
+	//a sane range so we can't feed every client's audio pipeline an arbitrary uint16.
+	double rate = LUA->CheckNumber(1);
+	if (rate < 6000.0 || rate > 48000.0)
+		LUA->ArgError(1, "sample rate must be between 6000 and 48000");
+
+	g_eightbit->sample_rate = (uint16_t)rate;
 	return 0;
 }
 
 LUA_FUNCTION_STATIC(eightbit_enableEffects) {
-	int id = LUA->GetNumber(1);
-	int eff = LUA->GetNumber(2);
+	int id = (int)LUA->CheckNumber(1);
+	int eff = (int)LUA->CheckNumber(2);
 
 	auto& afflicted_players = g_eightbit->afflictedPlayers;
 	if (afflicted_players.find(id) != afflicted_players.end()) {
@@ -197,9 +196,14 @@ LUA_FUNCTION_STATIC(eightbit_enableEffects) {
 		return 0;
 	}
 	else if(eff != 0) {
-		IVoiceCodec* codec = new SteamOpus::Opus_FrameDecoder();
+		SteamOpus::Opus_FrameDecoder* codec = new SteamOpus::Opus_FrameDecoder();
+		if (!codec->IsValid()) {
+			delete codec;
+			LUA->ThrowError("eightbit: failed to create opus codec instance");
+		}
+
 		codec->Init(5, g_eightbit->sample_rate);
-		afflicted_players.insert(std::pair<int, std::tuple<IVoiceCodec*, int>>(id, std::tuple<IVoiceCodec*, int>(codec, eff)));
+		afflicted_players.insert(std::pair<int, std::tuple<IVoiceCodec*, int>>(id, std::tuple<IVoiceCodec*, int>((IVoiceCodec*)codec, eff)));
 	}
 	return 0;
 }
@@ -207,6 +211,12 @@ LUA_FUNCTION_STATIC(eightbit_enableEffects) {
 GMOD_MODULE_OPEN()
 {
 	luaState = LUA->GetState();
+
+	//One long-lived table we refill for every voice packet, instead of allocating a fresh
+	//10k-entry table 20-40 times a second per speaking player.
+	LUA->CreateTable();
+	g_sampleTableRef = LUA->ReferenceCreate();
+	g_sampleTableFill = 0;
 
 	g_eightbit = new EightbitState();
 
@@ -266,8 +276,17 @@ GMOD_MODULE_OPEN()
 
 GMOD_MODULE_CLOSE()
 {
+	//Tear the detour down first - after this point nothing can enter the hook and touch
+	//luaState or the sample table while we are freeing them.
 	detour_BroadcastVoiceData.Disable();
 	detour_BroadcastVoiceData.Destroy();
+
+	if (g_sampleTableRef != -1) {
+		LUA->ReferenceFree(g_sampleTableRef);
+		g_sampleTableRef = -1;
+	}
+	g_sampleTableFill = 0;
+	luaState = nullptr;
 
 	for (auto& p : g_eightbit->afflictedPlayers) {
 		IVoiceCodec* codec = std::get<0>(p.second);
@@ -275,9 +294,12 @@ GMOD_MODULE_CLOSE()
 			delete codec;
 		}
 	}
+	g_eightbit->afflictedPlayers.clear();
 
 	delete net_handl;
+	net_handl = nullptr;
 	delete g_eightbit;
+	g_eightbit = nullptr;
 
 	return 0;
 }
