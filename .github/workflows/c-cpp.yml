@@ -9,19 +9,7 @@ on:
 jobs:
   build-linux:
     runs-on: ubuntu-latest
-    # Built inside an older image on purpose. On the runner's own userland (glibc 2.39)
-    # the toolchain emits symbols such as __isoc23_strtol@GLIBC_2.38, which a server with
-    # an older glibc cannot resolve - the module then fails to load with
-    # "version `GLIBC_2.38' not found". Symbol versions are decided at build time, so the
-    # only way to stay compatible is to build against an older glibc. 22.04 ships 2.35,
-    # which is old enough for the gmod containers in circulation.
-    container: ubuntu:22.04
     steps:
-    - name: Install build dependencies
-      run: |
-        apt-get update
-        apt-get install -y --no-install-recommends \
-          ca-certificates g++-multilib git make tar wget
     - uses: actions/checkout@v4
     - uses: actions/checkout@v4
       with:
@@ -31,21 +19,36 @@ jobs:
         # break or alter the binaries this repo produces.
         ref: f77a18d86f780a59ea30e4237016b05b790d4b70
         path: 'garrysmod_common'
-    - name: Install premake
+    - name: Install dependencies
       run: |
         wget https://github.com/premake/premake-core/releases/download/v5.0.0-beta8/premake-5.0.0-beta8-linux.tar.gz -O premake.tar.gz
         tar -xf premake.tar.gz
         chmod +x premake5
-        cp premake5 /usr/bin
+        sudo cp premake5 /usr/bin
+        sudo apt-get update
+        sudo apt-get install -y g++-multilib
         gcc --version
     - name: Test
       run: GMCOMMON=garrysmod_common ./test/run.sh
     - name: Generate Project
       run: premake5 --gmcommon=garrysmod_common gmake
+    # Compiled in an older image on purpose. On the runner's own userland (glibc 2.39)
+    # the toolchain emits references such as __isoc23_strtol@GLIBC_2.38, and a server
+    # with an older glibc then refuses to load the module:
+    #   /lib32/libc.so.6: version `GLIBC_2.38' not found
+    # Symbol versions are decided at link time, so the compile has to happen against an
+    # older glibc. Only this step moves into the container - premake5 itself needs the
+    # runner's glibc, and building it from source here would be a lot of moving parts
+    # for no gain. The volume is mounted at the same path so the generated makefiles,
+    # which reference the workspace absolutely, keep working.
     - name: Build
       run: |
-        cd projects/linux/gmake
-        make config=release_x86
+        docker run --rm -v "$PWD":"$PWD" -w "$PWD" ubuntu:22.04 sh -c '
+          set -e
+          apt-get update -qq
+          apt-get install -y --no-install-recommends g++-multilib make > /dev/null
+          cd projects/linux/gmake
+          make config=release_x86'
     - name: Verify runtime dependencies
       run: |
         so=projects/linux/gmake/x86/Release/gmsv_eightbit_linux.dll
