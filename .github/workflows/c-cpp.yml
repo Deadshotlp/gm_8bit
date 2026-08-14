@@ -9,7 +9,19 @@ on:
 jobs:
   build-linux:
     runs-on: ubuntu-latest
+    # Built inside an older image on purpose. On the runner's own userland (glibc 2.39)
+    # the toolchain emits symbols such as __isoc23_strtol@GLIBC_2.38, which a server with
+    # an older glibc cannot resolve - the module then fails to load with
+    # "version `GLIBC_2.38' not found". Symbol versions are decided at build time, so the
+    # only way to stay compatible is to build against an older glibc. 22.04 ships 2.35,
+    # which is old enough for the gmod containers in circulation.
+    container: ubuntu:22.04
     steps:
+    - name: Install build dependencies
+      run: |
+        apt-get update
+        apt-get install -y --no-install-recommends \
+          ca-certificates g++-multilib git make tar wget
     - uses: actions/checkout@v4
     - uses: actions/checkout@v4
       with:
@@ -19,14 +31,12 @@ jobs:
         # break or alter the binaries this repo produces.
         ref: f77a18d86f780a59ea30e4237016b05b790d4b70
         path: 'garrysmod_common'
-    - name: Install dependencies
+    - name: Install premake
       run: |
         wget https://github.com/premake/premake-core/releases/download/v5.0.0-beta8/premake-5.0.0-beta8-linux.tar.gz -O premake.tar.gz
         tar -xf premake.tar.gz
         chmod +x premake5
-        sudo cp premake5 /usr/bin
-        sudo apt-get update
-        sudo apt-get install -y g++-multilib
+        cp premake5 /usr/bin
         gcc --version
     - name: Test
       run: GMCOMMON=garrysmod_common ./test/run.sh
@@ -41,7 +51,16 @@ jobs:
         so=projects/linux/gmake/x86/Release/gmsv_eightbit_linux.dll
         readelf -d "$so" | grep NEEDED
         if readelf -d "$so" | grep -q 'NEEDED.*libstdc++'; then
-          echo "libstdc++ is linked dynamically - srcds ships an older one and dlopen will fail" >&2
+          echo "libstdc++ is linked dynamically - servers ship an older one and dlopen will fail" >&2
+          exit 1
+        fi
+        # Highest glibc symbol version the module asks for. Anything above what the
+        # target server provides means dlopen fails, so keep this pinned to the build
+        # image's glibc and let the job fail if a change raises it.
+        max=$(readelf -V "$so" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
+        echo "highest glibc symbol version required: $max"
+        if [ "$(printf '%s\nGLIBC_2.35\n' "$max" | sort -uV | tail -1)" != "GLIBC_2.35" ]; then
+          echo "module requires $max, which is newer than GLIBC_2.35 - too new for common gmod containers" >&2
           exit 1
         fi
     - uses: actions/upload-artifact@v4
