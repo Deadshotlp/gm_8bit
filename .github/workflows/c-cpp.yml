@@ -32,16 +32,38 @@ jobs:
       run: GMCOMMON=garrysmod_common ./test/run.sh
     - name: Generate Project
       run: premake5 --gmcommon=garrysmod_common gmake
+    # Compiled in an older image on purpose. On the runner's own userland (glibc 2.39)
+    # the toolchain emits references such as __isoc23_strtol@GLIBC_2.38, and a server
+    # with an older glibc then refuses to load the module:
+    #   /lib32/libc.so.6: version `GLIBC_2.38' not found
+    # Symbol versions are decided at link time, so the compile has to happen against an
+    # older glibc. Only this step moves into the container - premake5 itself needs the
+    # runner's glibc, and building it from source here would be a lot of moving parts
+    # for no gain. The volume is mounted at the same path so the generated makefiles,
+    # which reference the workspace absolutely, keep working.
     - name: Build
       run: |
-        cd projects/linux/gmake
-        make config=release_x86
+        docker run --rm -v "$PWD":"$PWD" -w "$PWD" ubuntu:22.04 sh -c '
+          set -e
+          apt-get update -qq
+          apt-get install -y --no-install-recommends g++-multilib make > /dev/null
+          cd projects/linux/gmake
+          make config=release_x86'
     - name: Verify runtime dependencies
       run: |
         so=projects/linux/gmake/x86/Release/gmsv_eightbit_linux.dll
         readelf -d "$so" | grep NEEDED
         if readelf -d "$so" | grep -q 'NEEDED.*libstdc++'; then
-          echo "libstdc++ is linked dynamically - srcds ships an older one and dlopen will fail" >&2
+          echo "libstdc++ is linked dynamically - servers ship an older one and dlopen will fail" >&2
+          exit 1
+        fi
+        # Highest glibc symbol version the module asks for. Anything above what the
+        # target server provides means dlopen fails, so keep this pinned to the build
+        # image's glibc and let the job fail if a change raises it.
+        max=$(readelf -V "$so" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
+        echo "highest glibc symbol version required: $max"
+        if [ "$(printf '%s\nGLIBC_2.35\n' "$max" | sort -uV | tail -1)" != "GLIBC_2.35" ]; then
+          echo "module requires $max, which is newer than GLIBC_2.35 - too new for common gmod containers" >&2
           exit 1
         fi
     - uses: actions/upload-artifact@v4
