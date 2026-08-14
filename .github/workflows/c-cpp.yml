@@ -36,6 +36,14 @@ jobs:
       run: |
         cd projects/linux/gmake
         make config=release_x86
+    - name: Verify runtime dependencies
+      run: |
+        so=projects/linux/gmake/x86/Release/gmsv_eightbit_linux.dll
+        readelf -d "$so" | grep NEEDED
+        if readelf -d "$so" | grep -q 'NEEDED.*libstdc++'; then
+          echo "libstdc++ is linked dynamically - srcds ships an older one and dlopen will fail" >&2
+          exit 1
+        fi
     - uses: actions/upload-artifact@v4
       with:
         name: gmsv_eightbit_linux.dll

@@ -29,3 +29,12 @@ CreateWorkspace({name = "eightbit"})
 
 		filter("system:windows")
 			links("ws2_32")
+
+		filter("system:linux")
+			-- Die CI baut auf einer neueren Toolchain als die Runtime typischer Server.
+			-- Dynamisch gelinkt traegt das Modul dadurch eine GLIBCXX-Version ein, die die
+			-- libstdc++ des Servers nicht kennt, und dlopen scheitert mit
+			-- "version GLIBCXX_3.4.32 not found".
+			-- --exclude-libs haelt die einkompilierten libstdc++/opus-Symbole aus der
+			-- dynamischen Symboltabelle heraus, damit sie nicht mit denen der Engine kollidieren.
+			linkoptions({"-static-libstdc++", "-static-libgcc", "-Wl,--exclude-libs,ALL"})
