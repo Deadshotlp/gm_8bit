@@ -27,7 +27,7 @@ struct CrossLinkState {
 	//remote steamid64 -> last time Lua was told about this speaker
 	std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> lastNotify;
 
-	uint64_t sentVoice = 0, sentMsg = 0, recvVoice = 0, recvMsg = 0, dropped = 0;
+	uint64_t sentVoice = 0, sentMsg = 0, recvVoice = 0, recvMsg = 0, dropped = 0, injected = 0;
 };
 
 struct EightbitState {

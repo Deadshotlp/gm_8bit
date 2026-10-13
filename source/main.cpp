@@ -488,7 +488,21 @@ LUA_FUNCTION_STATIC(eightbit_poll) {
 		//Through our own hook, so effects enabled on the bot (radio filter) apply.
 		//Bots are never in the relay list, which keeps the packet from bouncing back.
 		std::memcpy(voiceBuf, v.data, v.len);
+
+		//The packet still carries the remote speaker's steamid. Clients drop voice whose
+		//steamid does not belong to the sending slot, so it has to become the bot's -
+		//and the trailing CRC covers the steamid, so recompute it as well.
+#if defined ARCHITECTURE_X86
+		uint64_t botSid = *(uint64_t*)((char*)bot + 181);
+#else
+		uint64_t botSid = *(uint64_t*)((char*)bot + 189);
+#endif
+		std::memcpy(voiceBuf, &botSid, sizeof(botSid));
+		CRC32_t crc = CRC32_ProcessSingleBuffer(voiceBuf, v.len - sizeof(CRC32_t));
+		std::memcpy(voiceBuf + v.len - sizeof(CRC32_t), &crc, sizeof(CRC32_t));
+
 		hook_BroadcastVoiceData(bot, (uint)v.len, voiceBuf, 0);
+		link.injected++;
 	}
 
 	//Forget speakers that went quiet a while ago.
@@ -515,6 +529,7 @@ LUA_FUNCTION_STATIC(eightbit_linkstats) {
 	LUA->PushNumber((double)link.recvVoice); LUA->SetField(-2, "recv_voice");
 	LUA->PushNumber((double)link.recvMsg); LUA->SetField(-2, "recv_msg");
 	LUA->PushNumber((double)link.dropped); LUA->SetField(-2, "dropped");
+	LUA->PushNumber((double)link.injected); LUA->SetField(-2, "injected");
 	LUA->PushNumber((double)link.relay.size()); LUA->SetField(-2, "relaying");
 	LUA->PushNumber((double)link.bots.size()); LUA->SetField(-2, "bots");
 	return 1;
