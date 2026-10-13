@@ -28,6 +28,8 @@ struct CrossLinkState {
 	std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> lastNotify;
 
 	uint64_t sentVoice = 0, sentMsg = 0, recvVoice = 0, recvMsg = 0, dropped = 0, injected = 0;
+	//replayed packets that went through the bot's effect codec / that could not be decoded and were dropped
+	uint64_t reencoded = 0, injectDropped = 0;
 };
 
 struct EightbitState {

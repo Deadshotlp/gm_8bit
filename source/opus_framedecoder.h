@@ -60,9 +60,11 @@ namespace SteamOpus {
             return SAMPLERATE_GMOD_OPUS;
         }
 
+        //Starts decoding a new stream (e.g. a relay bot taking over another speaker). The
+        //encoder keeps running so the sequence numbers the clients see stay continuous.
         virtual bool ResetState() {
             opus_decoder_ctl(dec, OPUS_RESET_STATE);
-            opus_encoder_ctl(enc, OPUS_RESET_STATE);
+            m_seqKnown = false;
             return true;
         }
 
@@ -140,7 +142,10 @@ namespace SteamOpus {
 
                 CHK_BUF_ACCESS(seq, pCompressed, pEnd, uint16_t);
 
-                if (seq < m_seq) {
+                if (!m_seqKnown) {
+                    //First frame of a stream: nothing was lost yet, no concealment frames
+                    m_seqKnown = true;
+                } else if (seq < m_seq) {
                     opus_decoder_ctl(dec, OPUS_RESET_STATE);
                 } else if (seq > m_seq) {
                     uint32_t lostFrames = std::min(seq - m_seq, 10);
@@ -182,6 +187,7 @@ namespace SteamOpus {
 
     private:
         uint16_t m_seq = 0;
+        bool m_seqKnown = false;
         uint16_t m_encodeSeq = 0;
         OpusDecoder* dec = nullptr;
         OpusEncoder* enc = nullptr;

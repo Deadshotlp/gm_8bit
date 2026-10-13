@@ -56,6 +56,15 @@ Detouring::Hook detour_BroadcastVoiceData;
 
 lua_State* luaState = nullptr;
 
+//Set while Poll replays a packet from the partner server through a relay bot. Such a
+//packet must never go out undecoded: it carries the remote speaker's sequence numbers,
+//and mixing those with the bot's re-encoded stream makes clients drop audio.
+static bool g_injecting = false;
+
+static void DropInjected() {
+	g_eightbit->link.injectDropped++;
+}
+
 //Reusable table handed to the ApplyVoiceEffect hook. Allocating a fresh table for every
 //voice packet (20-40 per second per player) is what made this module a DoS vector.
 static int g_sampleTableRef = -1;
@@ -125,11 +134,13 @@ void hook_BroadcastVoiceData(IClient* cl, uint nBytes, char* data, int64 xuid) {
 		IVoiceCodec* codec = std::get<0>(afflicted_players.at(uid));
 
 		if(nBytes < STEAM_PCKT_SZ) {
+			if (g_injecting) return DropInjected();
 			return detour_BroadcastVoiceData.GetTrampoline<SV_BroadcastVoiceData>()(cl, nBytes, data, xuid);
 		}
 
 		int bytesDecompressed = SteamVoice::DecompressIntoBuffer(codec, data, nBytes, decompressedBuffer, sizeof(decompressedBuffer));
 		if (bytesDecompressed <= 0) {
+			if (g_injecting) return DropInjected();
 			//Just hit the trampoline at this point.
 			return detour_BroadcastVoiceData.GetTrampoline<SV_BroadcastVoiceData>()(cl, nBytes, data, xuid);
 		}
@@ -150,6 +161,7 @@ void hook_BroadcastVoiceData(IClient* cl, uint nBytes, char* data, int64 xuid) {
 		//codec out from under us. Look it up again instead of reusing the stale pointer.
 		auto it = afflicted_players.find(uid);
 		if (it == afflicted_players.end()) {
+			if (g_injecting) return DropInjected();
 			return detour_BroadcastVoiceData.GetTrampoline<SV_BroadcastVoiceData>()(cl, nBytes, data, xuid);
 		}
 		codec = std::get<0>(it->second);
@@ -158,12 +170,15 @@ void hook_BroadcastVoiceData(IClient* cl, uint nBytes, char* data, int64 xuid) {
 		uint64_t steamid = *(uint64_t*)data;
 		int bytesWritten = SteamVoice::CompressIntoBuffer(steamid, codec, decompressedBuffer, samples*2, recompressBuffer, sizeof(recompressBuffer), g_eightbit->sample_rate);
 		if (bytesWritten <= 0) {
+			if (g_injecting) return DropInjected();
 			return detour_BroadcastVoiceData.GetTrampoline<SV_BroadcastVoiceData>()(cl, nBytes, data, xuid);
 		}
 
 		#ifdef _DEBUG
 			std::cout << "Retransmitted pckt size: " << bytesWritten << std::endl;
 		#endif
+
+		if (g_injecting) g_eightbit->link.reencoded++;
 
 		//Broadcast voice data with our updated compressed data.
 		return detour_BroadcastVoiceData.GetTrampoline<SV_BroadcastVoiceData>()(cl, bytesWritten, recompressBuffer, xuid);
@@ -368,10 +383,28 @@ LUA_FUNCTION_STATIC(eightbit_assignbot) {
 		LUA->ArgError(1, "invalid steamid64");
 
 	auto& bots = g_eightbit->link.bots;
-	if (uid <= 0)
+	if (uid <= 0) {
 		bots.erase(sid);
-	else
-		bots[sid] = uid;
+		return 0;
+	}
+
+	auto cur = bots.find(sid);
+	bool changed = cur == bots.end() || cur->second != uid;
+
+	//One bot plays one speaker: drop whatever this bot played before
+	for (auto it = bots.begin(); it != bots.end();) {
+		if (it->second == uid && it->first != sid) it = bots.erase(it);
+		else ++it;
+	}
+	bots[sid] = uid;
+
+	//New speaker on this bot: its effect codec starts a fresh decode stream
+	if (changed) {
+		auto& afflicted = g_eightbit->afflictedPlayers;
+		auto ait = afflicted.find(uid);
+		if (ait != afflicted.end() && std::get<0>(ait->second) != nullptr)
+			std::get<0>(ait->second)->ResetState();
+	}
 	return 0;
 }
 
@@ -501,7 +534,9 @@ LUA_FUNCTION_STATIC(eightbit_poll) {
 		CRC32_t crc = CRC32_ProcessSingleBuffer(voiceBuf, v.len - sizeof(CRC32_t));
 		std::memcpy(voiceBuf + v.len - sizeof(CRC32_t), &crc, sizeof(CRC32_t));
 
+		g_injecting = true;
 		hook_BroadcastVoiceData(bot, (uint)v.len, voiceBuf, 0);
+		g_injecting = false;
 		link.injected++;
 	}
 
@@ -530,6 +565,8 @@ LUA_FUNCTION_STATIC(eightbit_linkstats) {
 	LUA->PushNumber((double)link.recvMsg); LUA->SetField(-2, "recv_msg");
 	LUA->PushNumber((double)link.dropped); LUA->SetField(-2, "dropped");
 	LUA->PushNumber((double)link.injected); LUA->SetField(-2, "injected");
+	LUA->PushNumber((double)link.reencoded); LUA->SetField(-2, "reencoded");
+	LUA->PushNumber((double)link.injectDropped); LUA->SetField(-2, "inject_dropped");
 	LUA->PushNumber((double)link.relay.size()); LUA->SetField(-2, "relaying");
 	LUA->PushNumber((double)link.bots.size()); LUA->SetField(-2, "bots");
 	return 1;
