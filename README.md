@@ -67,3 +67,35 @@ and always use `count` rather than `#samples`.
 GMCOMMON=/path/to/garrysmod_common ./test/run.sh
 ```
 
+
+## Crosslink (server to server)
+Links two servers over UDP: voice of selected players is replayed on the other server through a
+relay bot, and arbitrary strings can be exchanged. Every datagram carries a shared secret;
+packets with a wrong secret (or, if set, from another address) are dropped.
+
+`eightbit.LinkOpen(port)` Opens the non-blocking receive socket. Returns `true` or `false, error`.
+
+`eightbit.LinkClose()` Closes it and forgets all bot assignments.
+
+`eightbit.LinkSetPeer(ip, port)` Where to send to.
+
+`eightbit.LinkSetSecret(string)` Shared secret, at least 8 characters (the first 32 count).
+
+`eightbit.LinkAllowFrom(ip)` Only accept datagrams from this address. `""` accepts any sender with the secret.
+
+`eightbit.LinkLoopback(bool)` Accept our own packets - lets one server talk to itself for testing.
+
+`eightbit.SetRelay(userid, channelKey, name)` Relay this player's voice (raw, before effects) under a channel key. `channelKey` 0 or nil stops it.
+
+`eightbit.AssignBot(steamid64, botUserId)` Replay a remote speaker through this local bot. `0` releases it.
+
+`eightbit.SendMessage(string)` Sends a message (max. 1356 bytes). Returns false if the link is not configured.
+
+`eightbit.Poll()` Handles waiting datagrams; call it every tick. Fires
+`hook "CrossVoice"(steamid64, channelKey, name, botUserId)` (at most every 200 ms per remote speaker,
+`botUserId` is 0 while none is assigned) and `hook "CrossServerMessage"(message)`.
+
+`eightbit.LinkStats()` Counters and state as a table.
+
+Replayed voice goes through the normal `SV_BroadcastVoiceData` path of the bot, so
+`PlayerCanHearPlayersVoice` decides who hears it and `EnableEffects` on the bot applies.

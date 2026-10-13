@@ -25,3 +25,8 @@ g++ -std=c++17 -g -O0 -fsanitize=address,undefined \
 	"$(dirname "$0")/test_voice_effect_hook.cpp" -o "$OUT/test_voice_effect_hook"
 
 "$OUT/test_voice_effect_hook"
+
+g++ -std=c++17 -g -O0 -fsanitize=address,undefined \
+	"$(dirname "$0")/test_crosslink.cpp" -o "$OUT/test_crosslink"
+
+"$OUT/test_crosslink"

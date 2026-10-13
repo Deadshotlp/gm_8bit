@@ -6,7 +6,10 @@
 #include <detouring/hook.hpp>
 #include <iostream>
 #include <iclient.h>
+#include <iserver.h>
+#include <GarrysMod/InterfacePointers.hpp>
 #include <tier0/dbg.h>
+#include <random>
 #include <unordered_map>
 #include "ivoicecodec.h"
 #include "net.h"
@@ -72,8 +75,32 @@ void hook_BroadcastVoiceData(IClient* cl, uint nBytes, char* data, int64 xuid) {
 	}
 #endif
 
+	//Crosslink: players on a long-range channel go to the partner server as they are,
+	//before any local effect - the receiving side applies its own.
+	auto& link = g_eightbit->link;
+	if (!link.relay.empty() && link.hasSecret && link.peerPort != 0 && nBytes > STEAM_PCKT_SZ) {
+		auto rit = link.relay.find(uid);
+		if (rit != link.relay.end()) {
+#if defined ARCHITECTURE_X86
+			uint64_t sid = *(uint64_t*)((char*)cl + 181);
+#else
+			uint64_t sid = *(uint64_t*)((char*)cl + 189);
+#endif
+			static char linkBuffer[CrossLink::MAX_DATAGRAM];
+			size_t len = CrossLink::BuildVoice(linkBuffer, sizeof(linkBuffer), link.instance, link.secret,
+			                                   sid, rit->second.channel, rit->second.name, data, nBytes);
+			if (len > 0) {
+				net_handl->SendPacket(link.peerIp.c_str(), link.peerPort, linkBuffer, (uint32_t)len);
+				link.sentVoice++;
+			}
+			else {
+				link.dropped++;
+			}
+		}
+	}
+
 	auto& afflicted_players = g_eightbit->afflictedPlayers;
-	if (g_eightbit->broadcastPackets && nBytes > sizeof(uint64_t) && nBytes <= sizeof(decompressedBuffer)) {
+	if (g_eightbit->broadcastPackets &&nBytes > sizeof(uint64_t) && nBytes <= sizeof(decompressedBuffer)) {
 		//Get the user's steamid64, put it at the beginning of the buffer.
 		//Notice that we don't use the conveniently provided one in the voice packet. The client can manipulate that one.
 
@@ -208,6 +235,291 @@ LUA_FUNCTION_STATIC(eightbit_enableEffects) {
 	return 0;
 }
 
+//---------------------------------------------------------------------------------------
+// Crosslink: voice and messages between two servers
+//---------------------------------------------------------------------------------------
+
+//Finds the IClient of a connected player by userid (relay bots included).
+static IClient* FindClientByUserID(int uid) {
+	IServer* server = InterfacePointers::Server();
+	if (server == nullptr)
+		return nullptr;
+
+	for (int i = 0; i < server->GetClientCount(); i++) {
+		IClient* c = server->GetClient(i);
+		if (c != nullptr && c->IsConnected() && c->GetUserID() == uid)
+			return c;
+	}
+	return nullptr;
+}
+
+//Calls hook.Run(name, ...) with the arguments pushArgs leaves on the stack.
+//Errors are printed, never raised, and the stack is restored on every path.
+template <typename F>
+static void RunLuaHook(GarrysMod::Lua::ILuaBase* LUA, const char* name, int nargs, F pushArgs) {
+	const int base = LUA->Top();
+	LUA->PushSpecial(GarrysMod::Lua::SPECIAL_GLOB);
+	LUA->GetField(-1, "hook");
+	if (!LUA->IsType(-1, GarrysMod::Lua::Type::Table)) {
+		LUA->Pop(LUA->Top() - base);
+		return;
+	}
+	LUA->GetField(-1, "Run");
+	if (!LUA->IsType(-1, GarrysMod::Lua::Type::Function)) {
+		LUA->Pop(LUA->Top() - base);
+		return;
+	}
+	LUA->PushString(name);
+	pushArgs();
+	if (LUA->PCall(nargs + 1, 0, 0) != 0) {
+		const char* err = LUA->GetString(-1);
+		Warning("[eightbit] %s error: %s\n", name, err ? err : "(non-string error)");
+	}
+	LUA->Pop(LUA->Top() - base);
+}
+
+static uint64_t ParseSteamID(const char* s) {
+	return s ? std::strtoull(s, nullptr, 10) : 0;
+}
+
+//eightbit.LinkOpen(port) -> true | false, error
+LUA_FUNCTION_STATIC(eightbit_linkopen) {
+	double port = LUA->CheckNumber(1);
+	if (port < 1.0 || port > 65535.0)
+		LUA->ArgError(1, "port must be between 1 and 65535");
+
+	std::string err;
+	if (!net_handl->Bind((uint16_t)port, err)) {
+		LUA->PushBool(false);
+		LUA->PushString(err.c_str());
+		return 2;
+	}
+	LUA->PushBool(true);
+	return 1;
+}
+
+LUA_FUNCTION_STATIC(eightbit_linkclose) {
+	net_handl->Unbind();
+	g_eightbit->link.bots.clear();
+	g_eightbit->link.lastNotify.clear();
+	return 0;
+}
+
+//eightbit.LinkSetPeer(ip, port)
+LUA_FUNCTION_STATIC(eightbit_linksetpeer) {
+	const char* ip = LUA->CheckString(1);
+	double port = LUA->CheckNumber(2);
+	if (port < 0.0 || port > 65535.0)
+		LUA->ArgError(2, "port must be between 0 and 65535");
+
+	g_eightbit->link.peerIp = ip;
+	g_eightbit->link.peerPort = (uint16_t)port;
+	return 0;
+}
+
+//eightbit.LinkSetSecret(secret) - at least 8 characters, only the first 32 count
+LUA_FUNCTION_STATIC(eightbit_linksetsecret) {
+	unsigned int len = 0;
+	const char* s = LUA->GetString(1, &len);
+	if (s == nullptr || len < 8)
+		LUA->ArgError(1, "secret must be at least 8 characters");
+
+	CrossLink::PackSecret(std::string(s, len), g_eightbit->link.secret);
+	g_eightbit->link.hasSecret = true;
+	return 0;
+}
+
+//eightbit.LinkAllowFrom(ip) - "" accepts any sender that knows the secret
+LUA_FUNCTION_STATIC(eightbit_linkallowfrom) {
+	g_eightbit->link.allowFrom = LUA->CheckString(1);
+	return 0;
+}
+
+LUA_FUNCTION_STATIC(eightbit_linkloopback) {
+	LUA->CheckType(1, GarrysMod::Lua::Type::Bool);
+	g_eightbit->link.loopback = LUA->GetBool(1);
+	return 0;
+}
+
+//eightbit.SetRelay(userid, channelKey, name) - channelKey 0 stops relaying
+LUA_FUNCTION_STATIC(eightbit_setrelay) {
+	int uid = (int)LUA->CheckNumber(1);
+	double channel = LUA->IsType(2, GarrysMod::Lua::Type::Number) ? LUA->GetNumber(2) : 0.0;
+	auto& relay = g_eightbit->link.relay;
+
+	if (channel < 1.0 || channel > 4294967295.0) {
+		relay.erase(uid);
+		return 0;
+	}
+
+	RelayEntry e;
+	e.channel = (uint32_t)channel;
+	if (LUA->IsType(3, GarrysMod::Lua::Type::String))
+		e.name = LUA->GetString(3);
+	relay[uid] = e;
+	return 0;
+}
+
+//eightbit.AssignBot(steamid64String, botUserId) - 0 releases the mapping
+LUA_FUNCTION_STATIC(eightbit_assignbot) {
+	uint64_t sid = ParseSteamID(LUA->CheckString(1));
+	int uid = (int)LUA->CheckNumber(2);
+	if (sid == 0)
+		LUA->ArgError(1, "invalid steamid64");
+
+	auto& bots = g_eightbit->link.bots;
+	if (uid <= 0)
+		bots.erase(sid);
+	else
+		bots[sid] = uid;
+	return 0;
+}
+
+//eightbit.SendMessage(string) -> bool
+LUA_FUNCTION_STATIC(eightbit_sendmessage) {
+	unsigned int len = 0;
+	const char* msg = LUA->GetString(1, &len);
+	if (msg == nullptr)
+		LUA->ArgError(1, "string expected");
+
+	auto& link = g_eightbit->link;
+	if (!link.hasSecret || link.peerPort == 0 || len > CrossLink::MAX_MESSAGE) {
+		LUA->PushBool(false);
+		return 1;
+	}
+
+	char buf[CrossLink::MAX_DATAGRAM];
+	size_t n = CrossLink::BuildMessage(buf, sizeof(buf), link.instance, link.secret, msg, len);
+	if (n == 0) {
+		LUA->PushBool(false);
+		return 1;
+	}
+	net_handl->SendPacket(link.peerIp.c_str(), link.peerPort, buf, (uint32_t)n);
+	link.sentMsg++;
+	LUA->PushBool(true);
+	return 1;
+}
+
+//eightbit.Poll() -> datagrams handled
+//Replays voice through the assigned relay bots and fires
+//  hook "CrossVoice"(steamid64, channelKey, name, botUserId or 0)  at most every 200 ms per speaker
+//  hook "CrossServerMessage"(message)
+LUA_FUNCTION_STATIC(eightbit_poll) {
+	auto& link = g_eightbit->link;
+	if (!net_handl->IsBound() || !link.hasSecret) {
+		LUA->PushNumber(0);
+		return 1;
+	}
+
+	static char buf[CrossLink::MAX_DATAGRAM + 1];
+	static char voiceBuf[CrossLink::MAX_DATAGRAM];
+	std::string fromIp;
+	int handled = 0;
+	const auto now = std::chrono::steady_clock::now();
+
+	//Bounded per call so a flood cannot stall the tick.
+	for (int i = 0; i < 256; i++) {
+		int n = net_handl->Receive(buf, sizeof(buf), fromIp);
+		if (n <= 0)
+			break;
+		buf[n] = 0;
+		handled++;
+
+		CrossLink::Header hdr;
+		if ((size_t)n > CrossLink::MAX_DATAGRAM || !CrossLink::ParseHeader(buf, (size_t)n, link.secret, hdr)
+		    || (!link.allowFrom.empty() && fromIp != link.allowFrom)
+		    || (hdr.instance == link.instance && !link.loopback)) {
+			link.dropped++;
+			continue;
+		}
+
+		if (hdr.type == CrossLink::TYPE_MSG) {
+			link.recvMsg++;
+			const char* body = buf + CrossLink::HEADER_LEN;
+			size_t bodyLen = (size_t)n - CrossLink::HEADER_LEN;
+			RunLuaHook(LUA, "CrossServerMessage", 1, [&]() { LUA->PushString(body, (unsigned int)bodyLen); });
+			continue;
+		}
+
+		if (hdr.type != CrossLink::TYPE_VOICE) {
+			link.dropped++;
+			continue;
+		}
+
+		CrossLink::Voice v;
+		if (!CrossLink::ParseVoice(buf, (size_t)n, v) || v.len <= STEAM_PCKT_SZ) {
+			link.dropped++;
+			continue;
+		}
+		link.recvVoice++;
+
+		int botUid = 0;
+		auto bit = link.bots.find(v.steamid);
+		if (bit != link.bots.end())
+			botUid = bit->second;
+
+		//Tell Lua who is talking: assigns a bot on the first packet and keeps the
+		//speaker alive afterwards. Throttled - voice arrives 20-40 times a second.
+		auto nit = link.lastNotify.find(v.steamid);
+		if (nit == link.lastNotify.end() || now - nit->second >= std::chrono::milliseconds(200)) {
+			link.lastNotify[v.steamid] = now;
+			std::string sid = std::to_string(v.steamid);
+			RunLuaHook(LUA, "CrossVoice", 4, [&]() {
+				LUA->PushString(sid.c_str());
+				LUA->PushNumber((double)v.channel);
+				LUA->PushString(v.name.c_str());
+				LUA->PushNumber(botUid);
+			});
+
+			//The hook may just have assigned a bot.
+			bit = link.bots.find(v.steamid);
+			botUid = bit != link.bots.end() ? bit->second : 0;
+		}
+
+		if (botUid == 0)
+			continue;
+
+		IClient* bot = FindClientByUserID(botUid);
+		if (bot == nullptr) {
+			link.bots.erase(v.steamid);
+			continue;
+		}
+
+		//Through our own hook, so effects enabled on the bot (radio filter) apply.
+		//Bots are never in the relay list, which keeps the packet from bouncing back.
+		std::memcpy(voiceBuf, v.data, v.len);
+		hook_BroadcastVoiceData(bot, (uint)v.len, voiceBuf, 0);
+	}
+
+	//Forget speakers that went quiet a while ago.
+	for (auto it = link.lastNotify.begin(); it != link.lastNotify.end();) {
+		if (now - it->second > std::chrono::seconds(30))
+			it = link.lastNotify.erase(it);
+		else
+			++it;
+	}
+
+	LUA->PushNumber(handled);
+	return 1;
+}
+
+LUA_FUNCTION_STATIC(eightbit_linkstats) {
+	auto& link = g_eightbit->link;
+	LUA->CreateTable();
+	LUA->PushBool(net_handl->IsBound()); LUA->SetField(-2, "bound");
+	LUA->PushBool(link.hasSecret); LUA->SetField(-2, "secret");
+	LUA->PushString(link.peerIp.c_str()); LUA->SetField(-2, "peer_ip");
+	LUA->PushNumber(link.peerPort); LUA->SetField(-2, "peer_port");
+	LUA->PushNumber((double)link.sentVoice); LUA->SetField(-2, "sent_voice");
+	LUA->PushNumber((double)link.sentMsg); LUA->SetField(-2, "sent_msg");
+	LUA->PushNumber((double)link.recvVoice); LUA->SetField(-2, "recv_voice");
+	LUA->PushNumber((double)link.recvMsg); LUA->SetField(-2, "recv_msg");
+	LUA->PushNumber((double)link.dropped); LUA->SetField(-2, "dropped");
+	LUA->PushNumber((double)link.relay.size()); LUA->SetField(-2, "relaying");
+	LUA->PushNumber((double)link.bots.size()); LUA->SetField(-2, "bots");
+	return 1;
+}
+
 GMOD_MODULE_OPEN()
 {
 	luaState = LUA->GetState();
@@ -262,10 +574,58 @@ GMOD_MODULE_OPEN()
 		LUA->PushString("SetSampleRate");
 		LUA->PushCFunction(eightbit_setsamplerate);
 		LUA->SetTable(-3);
+
+		LUA->PushString("LinkOpen");
+		LUA->PushCFunction(eightbit_linkopen);
+		LUA->SetTable(-3);
+
+		LUA->PushString("LinkClose");
+		LUA->PushCFunction(eightbit_linkclose);
+		LUA->SetTable(-3);
+
+		LUA->PushString("LinkSetPeer");
+		LUA->PushCFunction(eightbit_linksetpeer);
+		LUA->SetTable(-3);
+
+		LUA->PushString("LinkSetSecret");
+		LUA->PushCFunction(eightbit_linksetsecret);
+		LUA->SetTable(-3);
+
+		LUA->PushString("LinkAllowFrom");
+		LUA->PushCFunction(eightbit_linkallowfrom);
+		LUA->SetTable(-3);
+
+		LUA->PushString("LinkLoopback");
+		LUA->PushCFunction(eightbit_linkloopback);
+		LUA->SetTable(-3);
+
+		LUA->PushString("SetRelay");
+		LUA->PushCFunction(eightbit_setrelay);
+		LUA->SetTable(-3);
+
+		LUA->PushString("AssignBot");
+		LUA->PushCFunction(eightbit_assignbot);
+		LUA->SetTable(-3);
+
+		LUA->PushString("SendMessage");
+		LUA->PushCFunction(eightbit_sendmessage);
+		LUA->SetTable(-3);
+
+		LUA->PushString("Poll");
+		LUA->PushCFunction(eightbit_poll);
+		LUA->SetTable(-3);
+
+		LUA->PushString("LinkStats");
+		LUA->PushCFunction(eightbit_linkstats);
+		LUA->SetTable(-3);
 	LUA->SetTable(-3);
 	LUA->Pop();
 
 	net_handl = new Net();
+
+	//Identifies this module instance in crosslink packets, so we can drop our own.
+	std::random_device rd;
+	g_eightbit->link.instance = ((uint32_t)rd() << 1) | 1u;
 
 #ifdef THIRDPARTY_LINK
 	linkMutedFunc();
